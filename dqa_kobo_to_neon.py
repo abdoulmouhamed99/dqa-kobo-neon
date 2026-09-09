@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """
 Pipeline DQA Kobo -> Neon (PostgreSQL) — version script, sans interface.
- 
+
 Reprend exactement les étapes 3 à 7 du notebook Colab :
   3. Récupération du formulaire Kobo + génération des règles + dictionnaire des labels
   4. Récupération des soumissions + nettoyage des noms de colonnes
   5. Moteur DQA (complétude, validité, doublons, valeurs aberrantes)
   6. (dashboard visuel ignoré ici — pas d'écran en exécution planifiée)
   7. Envoi vers Neon (submissions, dqa_runs, dqa_results, dqa_issues, dictionary)
- 
+
 Toute la configuration passe par des VARIABLES D'ENVIRONNEMENT (jamais de input()/getpass()) :
   KOBO_SERVER         ex: kf.kobotoolbox.org
   KOBO_ASSET_UID      ex: aAbBcCdD1234...
@@ -16,7 +16,7 @@ Toute la configuration passe par des VARIABLES D'ENVIRONNEMENT (jamais de input(
   NEON_DATABASE_URL   chaîne de connexion Neon (postgresql://user:pass@host/db)
   DUPLICATE_SUBSET    (optionnel) colonnes séparées par des virgules pour détecter les doublons,
                        défaut: "s0_3"
- 
+
 Utilisation locale :
   export KOBO_SERVER=kf.kobotoolbox.org
   export KOBO_ASSET_UID=...
@@ -24,19 +24,19 @@ Utilisation locale :
   export NEON_DATABASE_URL=postgresql://...
   python dqa_kobo_to_neon.py
 """
- 
+
 import os
 import re
 import sys
 from datetime import datetime, timezone
 from urllib.parse import urlparse, parse_qs
- 
+
 import numpy as np
 import pandas as pd
 import requests
 from sqlalchemy import create_engine, text
- 
- 
+
+
 # --------------------------------------------------------------------------
 # 0. Configuration — lue depuis les variables d'environnement uniquement
 # --------------------------------------------------------------------------
@@ -46,28 +46,28 @@ def get_required_env(name: str) -> str:
         print(f"❌ Variable d'environnement manquante : {name}", file=sys.stderr)
         sys.exit(1)
     return value
- 
- 
+
+
 KOBO_SERVER = get_required_env("KOBO_SERVER")
 ASSET_UID = get_required_env("KOBO_ASSET_UID")
 API_TOKEN = get_required_env("KOBO_API_TOKEN")
 NEON_DATABASE_URL = get_required_env("NEON_DATABASE_URL")
 DUPLICATE_SUBSET = [c.strip() for c in os.environ.get("DUPLICATE_SUBSET", "s0_3").split(",") if c.strip()]
- 
+
 # Tolère un secret KOBO_SERVER déjà préfixé par http(s):// (évite le bug "https://https://...")
 KOBO_SERVER = re.sub(r"^https?://", "", KOBO_SERVER).rstrip("/")
 BASE_URL = f"https://{KOBO_SERVER}"
- 
+
 # Neon exige SSL — on force sslmode=require si absent de l'URL
 parsed = urlparse(NEON_DATABASE_URL)
 qs = parse_qs(parsed.query)
 if "sslmode" not in qs:
     sep = "&" if parsed.query else "?"
     NEON_DATABASE_URL = f"{NEON_DATABASE_URL}{sep}sslmode=require"
- 
+
 print(f"✅ Configuré pour {BASE_URL} / asset {ASSET_UID}")
- 
- 
+
+
 # --------------------------------------------------------------------------
 # 3. Récupération du formulaire + génération des règles + dictionnaire
 # --------------------------------------------------------------------------
@@ -76,19 +76,19 @@ def kobo_get(url, token):
     r = requests.get(url, headers=headers, timeout=60)
     r.raise_for_status()
     return r.json()
- 
- 
+
+
 def fetch_survey_structure(base_url, uid, token):
     url = f"{base_url}/api/v2/assets/{uid}/?format=json"
     data = kobo_get(url, token)
     return data.get("content", {}).get("survey", []), data.get("name", uid)
- 
- 
+
+
 def short_name(name: str) -> str:
     name = str(name).split("/")[-1]
     return re.sub(r"[^a-zA-Z0-9_]", "_", name).lower()
- 
- 
+
+
 def parse_constraint(constraint):
     constraint = constraint.strip()
     m = re.match(r"regex\(\.\s*,\s*\'([^\']*)\'\)", constraint)
@@ -105,8 +105,8 @@ def parse_constraint(constraint):
                 rule["max"] = float(max_match.group(1))
             return rule
     return {"type": "manual_review", "expression": constraint}
- 
- 
+
+
 def generate_rules(survey_structure):
     rules, manual_review = {}, {}
     for row in survey_structure:
@@ -121,8 +121,8 @@ def generate_rules(survey_structure):
         else:
             rules[clean_name] = parsed_rule
     return rules, manual_review
- 
- 
+
+
 def _first_label(label_field):
     if isinstance(label_field, list):
         for l in label_field:
@@ -130,8 +130,8 @@ def _first_label(label_field):
                 return str(l)
         return ""
     return str(label_field or "")
- 
- 
+
+
 def build_label_dictionary(survey_structure):
     labels = {}
     for row in survey_structure:
@@ -144,8 +144,8 @@ def build_label_dictionary(survey_structure):
         if clean not in labels or (label and not labels[clean][0]):
             labels[clean] = (label, qtype)
     return labels
- 
- 
+
+
 # --------------------------------------------------------------------------
 # 4. Récupération des soumissions
 # --------------------------------------------------------------------------
@@ -157,8 +157,8 @@ def fetch_all_submissions(base_url, uid, token, page_size=1000):
         all_results.extend(data.get("results", []))
         url = data.get("next")
     return all_results
- 
- 
+
+
 # --------------------------------------------------------------------------
 # 5. Moteur DQA
 # --------------------------------------------------------------------------
@@ -170,11 +170,11 @@ def check_numeric(series, min_value=None, max_value=None):
     if max_value is not None:
         errors |= numeric > max_value
     return errors
- 
- 
+
+
 def check_regex(series, pattern):
     compiled = re.compile(pattern)
- 
+
     def _is_invalid(value):
         # pd.isna gère tous les types de "manquant" (NaN, None, NaT...) avant toute conversion
         if pd.isna(value):
@@ -183,33 +183,33 @@ def check_regex(series, pattern):
         if text in ("", "nan", "None"):
             return False
         return not bool(compiled.match(text))
- 
+
     return series.apply(_is_invalid)
- 
- 
+
+
 def check_missing(df):
     return df.isna() | (df.astype(str).apply(lambda c: c.str.strip()) == "")
- 
- 
+
+
 def check_duplicates(df, subset):
     subset = [c for c in subset if c in df.columns]
     if not subset:
         return pd.Series(False, index=df.index)
     return df.duplicated(subset=subset, keep=False)
- 
- 
+
+
 def check_outliers_iqr(series):
     numeric = pd.to_numeric(series, errors="coerce")
     q1, q3 = numeric.quantile(0.25), numeric.quantile(0.75)
     iqr = q3 - q1
     low, high = q1 - 1.5 * iqr, q3 + 1.5 * iqr
     return (numeric < low) | (numeric > high)
- 
- 
+
+
 def run_dqa(df: pd.DataFrame, rules: dict, duplicate_subset=None, uuid_col=None):
     n_obs = len(df)
     results_rows, issues_rows = [], []
- 
+
     for variable, rule in rules.items():
         if variable not in df.columns:
             continue
@@ -219,7 +219,7 @@ def run_dqa(df: pd.DataFrame, rules: dict, duplicate_subset=None, uuid_col=None)
             errors = check_regex(df[variable], rule["pattern"])
         else:
             continue
- 
+
         n_errors = int(errors.sum())
         results_rows.append({
             "variable": variable, "controle": "validite",
@@ -232,42 +232,42 @@ def run_dqa(df: pd.DataFrame, rules: dict, duplicate_subset=None, uuid_col=None)
                 "variable": variable, "type": "valeur_invalide",
                 "valeur": df.at[idx, variable],
             })
- 
+
     missing = check_missing(df)
     completeness = 100 * (1 - missing.mean().mean())
- 
+
     if duplicate_subset:
         n_dup = int(check_duplicates(df, duplicate_subset).sum())
     else:
         n_dup = 0
- 
+
     n_outliers = 0
     for variable, rule in rules.items():
         if rule["type"] == "numeric" and variable in df.columns:
             n_outliers += int(check_outliers_iqr(df[variable]).sum())
- 
+
     validity_errors = sum(r["erreurs"] for r in results_rows)
     n_vars_checked = len(results_rows)
     validity_score = 100 * (1 - validity_errors / (n_obs * n_vars_checked)) if n_obs and n_vars_checked else 100
- 
+
     global_score = round((completeness + validity_score) / 2, 1)
     status = "EXCELLENT" if global_score >= 95 else "BON" if global_score >= 85 else "A AMELIORER"
- 
+
     return {
         "run_date": datetime.now(timezone.utc),
-        "n_obs": n_obs,
-        "n_vars_checked": n_vars_checked,
-        "completeness_score": round(completeness, 2),
-        "validity_score": round(validity_score, 2),
-        "global_score": global_score,
+        "n_obs": int(n_obs),
+        "n_vars_checked": int(n_vars_checked),
+        "completeness_score": float(round(completeness, 2)),
+        "validity_score": float(round(validity_score, 2)),
+        "global_score": float(global_score),
         "status": status,
-        "n_duplicates": n_dup,
-        "n_outliers": n_outliers,
+        "n_duplicates": int(n_dup),
+        "n_outliers": int(n_outliers),
         "results": pd.DataFrame(results_rows),
         "issues": pd.DataFrame(issues_rows),
     }
- 
- 
+
+
 # --------------------------------------------------------------------------
 # 7. Envoi vers Neon
 # --------------------------------------------------------------------------
@@ -286,7 +286,7 @@ CREATE TABLE IF NOT EXISTS dqa_runs (
     n_duplicates INTEGER,
     n_outliers INTEGER
 );
- 
+
 CREATE TABLE IF NOT EXISTS dqa_results (
     id SERIAL PRIMARY KEY,
     run_id INTEGER REFERENCES dqa_runs(run_id),
@@ -295,7 +295,7 @@ CREATE TABLE IF NOT EXISTS dqa_results (
     erreurs INTEGER,
     error_rate NUMERIC
 );
- 
+
 CREATE TABLE IF NOT EXISTS dqa_issues (
     id SERIAL PRIMARY KEY,
     run_id INTEGER REFERENCES dqa_runs(run_id),
@@ -305,7 +305,7 @@ CREATE TABLE IF NOT EXISTS dqa_issues (
     type TEXT,
     valeur TEXT
 );
- 
+
 CREATE TABLE IF NOT EXISTS dictionary (
     variable TEXT PRIMARY KEY,
     label TEXT,
@@ -313,8 +313,8 @@ CREATE TABLE IF NOT EXISTS dictionary (
     chemin_kobo TEXT
 );
 """
- 
- 
+
+
 def main():
     # --- Étape 3 ---
     survey_structure, form_name = fetch_survey_structure(BASE_URL, ASSET_UID, API_TOKEN)
@@ -323,11 +323,11 @@ def main():
     print(f'✅ Formulaire : "{form_name}"')
     print(f"✅ {len(rules)} règles générées, {len(manual_review)} à vérifier manuellement")
     print(f"✅ {len(label_dictionary)} libellés de questions récupérés")
- 
+
     # --- Étape 4 ---
     submissions_raw = fetch_all_submissions(BASE_URL, ASSET_UID, API_TOKEN)
     df = pd.json_normalize(submissions_raw)
- 
+
     rename_map, seen = {}, set()
     for col in df.columns:
         base = short_name(col)
@@ -343,7 +343,7 @@ def main():
         rename_map[col] = candidate
         seen.add(candidate)
     df = df.rename(columns=rename_map)
- 
+
     # Filet de sécurité : si deux colonnes finissent quand même avec le même nom
     # (cas limite avec un très gros formulaire), on les distingue avant d'aller plus loin.
     if df.columns.duplicated().any():
@@ -354,7 +354,7 @@ def main():
                 cols[idx] = f"{dup}_{i}"
         df.columns = cols
         print(f"⚠️ {len(idxs)} colonnes en doublon détectées et renommées automatiquement ({dup}...)")
- 
+
     dictionary_rows = []
     for original_col, clean_col in rename_map.items():
         label, qtype = label_dictionary.get(short_name(original_col), ("", ""))
@@ -365,10 +365,10 @@ def main():
             "chemin_kobo": original_col,
         })
     dictionary_df = pd.DataFrame(dictionary_rows)
- 
+
     uuid_col = "_uuid" if "_uuid" in df.columns else None
     print(f"✅ {len(df)} soumissions, {len(df.columns)} colonnes")
- 
+
     # --- Étape 5 ---
     report = run_dqa(df, rules, duplicate_subset=DUPLICATE_SUBSET, uuid_col=uuid_col)
     print(f"""
@@ -387,14 +387,14 @@ SCORE GLOBAL            : {report['global_score']} %
 --------------------------------
 Statut : {report['status']}
 """)
- 
+
     # --- Étape 7 ---
     conn_str = NEON_DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
     engine = create_engine(conn_str, pool_pre_ping=True)
- 
+
     with engine.begin() as conn:
         conn.execute(text(DDL))
- 
+
     with engine.begin() as conn:
         result = conn.execute(text("""
             INSERT INTO dqa_runs
@@ -414,14 +414,14 @@ Statut : {report['status']}
             "n_duplicates": report["n_duplicates"], "n_outliers": report["n_outliers"],
         })
         run_id = result.scalar()
- 
+
     results_df = report["results"].copy()
     if not results_df.empty:
         results_df["run_id"] = run_id
         results_df["error_rate"] = results_df["taux"] / 100
         results_df[["run_id", "variable", "controle", "erreurs", "error_rate"]].to_sql(
             "dqa_results", engine, if_exists="append", index=False)
- 
+
     issues_df = report["issues"].copy()
     if not issues_df.empty:
         issues_df["run_id"] = run_id
@@ -429,16 +429,15 @@ Statut : {report['status']}
         issues_df["valeur"] = issues_df["valeur"].astype(str)
         issues_df[["run_id", "submission_uuid", "row_id", "variable", "type", "valeur"]].to_sql(
             "dqa_issues", engine, if_exists="append", index=False)
- 
+
     df.to_sql("submissions", engine, if_exists="replace", index=False)
     dictionary_df.to_sql("dictionary", engine, if_exists="replace", index=False)
- 
+
     print(f"✅ Run #{run_id} envoyé vers Neon")
     print(f"✅ {len(results_df)} lignes dans dqa_results, {len(issues_df)} lignes dans dqa_issues")
     print(f"✅ Table submissions mise à jour ({len(df)} lignes)")
     print(f"✅ Table dictionary mise à jour ({len(dictionary_df)} variables)")
- 
- 
+
+
 if __name__ == "__main__":
     main()
- 
