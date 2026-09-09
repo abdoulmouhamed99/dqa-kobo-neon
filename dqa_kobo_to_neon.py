@@ -25,6 +25,7 @@ Utilisation locale :
   python dqa_kobo_to_neon.py
 """
 
+import json
 import os
 import re
 import sys
@@ -269,6 +270,29 @@ def run_dqa(df: pd.DataFrame, rules: dict, duplicate_subset=None, uuid_col=None)
 
 
 # --------------------------------------------------------------------------
+# 6bis. Sérialisation des colonnes "repeat group" (listes/dicts) en JSON texte
+#       avant l'envoi vers Neon — PostgreSQL ne sait pas stocker un objet
+#       Python brut dans une colonne.
+# --------------------------------------------------------------------------
+def _jsonify_value(value):
+    if isinstance(value, (list, dict)):
+        return json.dumps(value, ensure_ascii=False, default=str)
+    return value
+
+
+def prepare_df_for_sql(df: pd.DataFrame) -> pd.DataFrame:
+    df = df.copy()
+    n_converted = 0
+    for col in df.columns:
+        if df[col].map(lambda v: isinstance(v, (list, dict))).any():
+            df[col] = df[col].map(_jsonify_value)
+            n_converted += 1
+    if n_converted:
+        print(f"ℹ️ {n_converted} colonne(s) de type répétition (listes/dicts) converties en JSON texte")
+    return df
+
+
+# --------------------------------------------------------------------------
 # 7. Envoi vers Neon
 # --------------------------------------------------------------------------
 DDL = """
@@ -430,6 +454,7 @@ Statut : {report['status']}
         issues_df[["run_id", "submission_uuid", "row_id", "variable", "type", "valeur"]].to_sql(
             "dqa_issues", engine, if_exists="append", index=False)
 
+    df = prepare_df_for_sql(df)
     df.to_sql("submissions", engine, if_exists="replace", index=False)
     dictionary_df.to_sql("dictionary", engine, if_exists="replace", index=False)
 
