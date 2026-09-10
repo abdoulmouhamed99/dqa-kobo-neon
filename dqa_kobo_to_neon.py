@@ -58,6 +58,18 @@ DUPLICATE_SUBSET = [c.strip() for c in os.environ.get("DUPLICATE_SUBSET", "s0_3"
 # (rempli automatiquement si la soumission est authentifiée). Si ton formulaire
 # a plutôt une question dédiée (ex: "nom_enqueteur"), mets-la dans cette variable.
 ENUMERATOR_COL = os.environ.get("ENUMERATOR_COL", "_submitted_by").strip()
+# Champs système Kobo à ne JAMAIS compter comme "manquants" (métadonnées techniques,
+# toujours présentes ou légitimement vides, ne relèvent pas de la qualité de la collecte).
+SYSTEM_COLUMNS = {
+    "_id", "_uuid", "_submission_time", "_submitted_by", "_validation_status",
+    "_notes", "_status", "_tags", "_index", "_xform_id_string", "_attachments",
+    "_geolocation", "_supplementary_details", "__version__", "formhub_uuid",
+    "meta_instanceid", "start", "end", "today", "deviceid", "phonenumber",
+    "username", "simserial", "subscriberid", "imei", "audit",
+}
+# Colonnes supplémentaires à exclure du contrôle de complétude, propres à votre formulaire
+# (questions à logique conditionnelle légitimement vides, groupes de répétition sérialisés...)
+EXCLUDE_MISSING_COLS = {c.strip() for c in os.environ.get("EXCLUDE_MISSING_COLS", "").split(",") if c.strip()}
 
 # Tolère un secret KOBO_SERVER déjà préfixé par http(s):// (évite le bug "https://https://...")
 KOBO_SERVER = re.sub(r"^https?://", "", KOBO_SERVER).rstrip("/")
@@ -247,9 +259,16 @@ def run_dqa(df: pd.DataFrame, rules: dict, duplicate_subset=None, uuid_col=None,
             })
 
     # --- 5.2 Complétude (valeurs manquantes) : journalisée variable par variable ---
+    # On exclut les champs système Kobo et les colonnes de type liste/dict (repeat groups
+    # déjà sérialisés en JSON) qui n'ont pas de sens en "manquant/pas manquant" simple.
     missing = check_missing(df)
-    completeness = 100 * (1 - missing.mean().mean())
-    for variable in df.columns:
+    checked_cols = [
+        c for c in df.columns
+        if c not in SYSTEM_COLUMNS and c not in EXCLUDE_MISSING_COLS
+        and not df[c].map(lambda v: isinstance(v, (list, dict))).any()
+    ]
+    completeness = 100 * (1 - missing[checked_cols].mean().mean()) if checked_cols else 100
+    for variable in checked_cols:
         col_missing = missing[variable]
         n_missing = int(col_missing.sum())
         if n_missing == 0:
@@ -316,6 +335,7 @@ def run_dqa(df: pd.DataFrame, rules: dict, duplicate_subset=None, uuid_col=None,
         "run_date": datetime.now(timezone.utc),
         "n_obs": int(n_obs),
         "n_vars_checked": int(n_vars_checked),
+        "n_vars_completeness_checked": int(len(checked_cols)),
         "completeness_score": float(round(completeness, 2)),
         "validity_score": float(round(validity_score, 2)),
         "global_score": float(global_score),
@@ -476,6 +496,8 @@ SCORE GLOBAL            : {report['global_score']} %
 --------------------------------
 Statut : {report['status']}
 """)
+    print(f"ℹ️ {len(report['issues'])} anomalies au total à insérer dans dqa_issues "
+          f"(variables contrôlées pour la complétude : {report['n_vars_completeness_checked']})")
 
     # --- Étape 7 ---
     conn_str = NEON_DATABASE_URL.replace("postgresql://", "postgresql+psycopg2://", 1)
@@ -483,6 +505,10 @@ Statut : {report['status']}
 
     with engine.begin() as conn:
         conn.execute(text(DDL))
+        # Filet de sécurité : si dqa_issues existait déjà (déploiement précédent, sans la
+        # colonne enqueteur), on l'ajoute ici automatiquement plutôt que de dépendre d'une
+        # étape manuelle sur Neon.
+        conn.execute(text("ALTER TABLE dqa_issues ADD COLUMN IF NOT EXISTS enqueteur TEXT;"))
 
     with engine.begin() as conn:
         result = conn.execute(text("""
@@ -515,9 +541,9 @@ Statut : {report['status']}
     if not issues_df.empty:
         issues_df["run_id"] = run_id
         issues_df = issues_df.rename(columns={"row": "row_id"})
-        issues_df["valeur"] = issues_df["valeur"].astype(str)
+        issues_df["valeur"] = issues_df["valeur"].astype(str).replace({"None": None, "nan": None})
         issues_df[["run_id", "submission_uuid", "row_id", "enqueteur", "variable", "type", "valeur"]].to_sql(
-            "dqa_issues", engine, if_exists="append", index=False)
+            "dqa_issues", engine, if_exists="append", index=False, chunksize=500, method="multi")
 
     df = prepare_df_for_sql(df)
     df.to_sql("submissions", engine, if_exists="replace", index=False)
