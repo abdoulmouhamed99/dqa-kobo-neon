@@ -54,6 +54,10 @@ ASSET_UID = get_required_env("KOBO_ASSET_UID")
 API_TOKEN = get_required_env("KOBO_API_TOKEN")
 NEON_DATABASE_URL = get_required_env("NEON_DATABASE_URL")
 DUPLICATE_SUBSET = [c.strip() for c in os.environ.get("DUPLICATE_SUBSET", "s0_3").split(",") if c.strip()]
+# Colonne identifiant l'enquêteur : par défaut le champ Kobo "_submitted_by"
+# (rempli automatiquement si la soumission est authentifiée). Si ton formulaire
+# a plutôt une question dédiée (ex: "nom_enqueteur"), mets-la dans cette variable.
+ENUMERATOR_COL = os.environ.get("ENUMERATOR_COL", "_submitted_by").strip()
 
 # Tolère un secret KOBO_SERVER déjà préfixé par http(s):// (évite le bug "https://https://...")
 KOBO_SERVER = re.sub(r"^https?://", "", KOBO_SERVER).rstrip("/")
@@ -207,10 +211,17 @@ def check_outliers_iqr(series):
     return (numeric < low) | (numeric > high)
 
 
-def run_dqa(df: pd.DataFrame, rules: dict, duplicate_subset=None, uuid_col=None):
+def run_dqa(df: pd.DataFrame, rules: dict, duplicate_subset=None, uuid_col=None, enumerator_col=None):
     n_obs = len(df)
     results_rows, issues_rows = [], []
 
+    def _enqueteur(idx):
+        if enumerator_col and enumerator_col in df.columns:
+            val = df.at[idx, enumerator_col]
+            return None if pd.isna(val) else str(val)
+        return None
+
+    # --- 5.1 Validité (regex / bornes numériques déjà déclarées dans le xlsform) ---
     for variable, rule in rules.items():
         if variable not in df.columns:
             continue
@@ -230,25 +241,72 @@ def run_dqa(df: pd.DataFrame, rules: dict, duplicate_subset=None, uuid_col=None)
             issues_rows.append({
                 "row": idx,
                 "submission_uuid": df.at[idx, uuid_col] if uuid_col else None,
+                "enqueteur": _enqueteur(idx),
                 "variable": variable, "type": "valeur_invalide",
                 "valeur": df.at[idx, variable],
             })
 
+    # --- 5.2 Complétude (valeurs manquantes) : journalisée variable par variable ---
     missing = check_missing(df)
     completeness = 100 * (1 - missing.mean().mean())
+    for variable in df.columns:
+        col_missing = missing[variable]
+        n_missing = int(col_missing.sum())
+        if n_missing == 0:
+            continue
+        results_rows.append({
+            "variable": variable, "controle": "completude",
+            "erreurs": n_missing, "taux": round(100 * n_missing / n_obs, 2) if n_obs else 0,
+        })
+        for idx in df.index[col_missing]:
+            issues_rows.append({
+                "row": idx,
+                "submission_uuid": df.at[idx, uuid_col] if uuid_col else None,
+                "enqueteur": _enqueteur(idx),
+                "variable": variable, "type": "valeur_manquante",
+                "valeur": None,
+            })
 
+    # --- 5.3 Doublons : journalisés ligne par ligne ---
     if duplicate_subset:
-        n_dup = int(check_duplicates(df, duplicate_subset).sum())
+        dup_mask = check_duplicates(df, duplicate_subset)
+        n_dup = int(dup_mask.sum())
+        if n_dup:
+            for idx in df.index[dup_mask]:
+                issues_rows.append({
+                    "row": idx,
+                    "submission_uuid": df.at[idx, uuid_col] if uuid_col else None,
+                    "enqueteur": _enqueteur(idx),
+                    "variable": "+".join(duplicate_subset), "type": "doublon",
+                    "valeur": " | ".join(str(df.at[idx, c]) for c in duplicate_subset if c in df.columns),
+                })
     else:
         n_dup = 0
 
+    # --- 5.4 Valeurs aberrantes (IQR) : journalisées ligne par ligne ---
     n_outliers = 0
     for variable, rule in rules.items():
         if rule["type"] == "numeric" and variable in df.columns:
-            n_outliers += int(check_outliers_iqr(df[variable]).sum())
+            out_mask = check_outliers_iqr(df[variable])
+            n_out = int(out_mask.sum())
+            n_outliers += n_out
+            if n_out:
+                results_rows.append({
+                    "variable": variable, "controle": "aberrant",
+                    "erreurs": n_out, "taux": round(100 * n_out / n_obs, 2) if n_obs else 0,
+                })
+                for idx in df.index[out_mask]:
+                    issues_rows.append({
+                        "row": idx,
+                        "submission_uuid": df.at[idx, uuid_col] if uuid_col else None,
+                        "enqueteur": _enqueteur(idx),
+                        "variable": variable, "type": "valeur_aberrante",
+                        "valeur": df.at[idx, variable],
+                    })
 
-    validity_errors = sum(r["erreurs"] for r in results_rows)
-    n_vars_checked = len(results_rows)
+    validity_rows = [r for r in results_rows if r["controle"] == "validite"]
+    validity_errors = sum(r["erreurs"] for r in validity_rows)
+    n_vars_checked = len(validity_rows)
     validity_score = 100 * (1 - validity_errors / (n_obs * n_vars_checked)) if n_obs and n_vars_checked else 100
 
     global_score = round((completeness + validity_score) / 2, 1)
@@ -325,10 +383,14 @@ CREATE TABLE IF NOT EXISTS dqa_issues (
     run_id INTEGER REFERENCES dqa_runs(run_id),
     submission_uuid TEXT,
     row_id INTEGER,
+    enqueteur TEXT,
     variable TEXT,
     type TEXT,
     valeur TEXT
 );
+
+-- Si la table existe déjà (déploiement précédent), exécuter une fois :
+-- ALTER TABLE dqa_issues ADD COLUMN IF NOT EXISTS enqueteur TEXT;
 
 CREATE TABLE IF NOT EXISTS dictionary (
     variable TEXT PRIMARY KEY,
@@ -394,7 +456,10 @@ def main():
     print(f"✅ {len(df)} soumissions, {len(df.columns)} colonnes")
 
     # --- Étape 5 ---
-    report = run_dqa(df, rules, duplicate_subset=DUPLICATE_SUBSET, uuid_col=uuid_col)
+    enumerator_col = ENUMERATOR_COL if ENUMERATOR_COL in df.columns else None
+    if ENUMERATOR_COL and not enumerator_col:
+        print(f"⚠️ Colonne enquêteur '{ENUMERATOR_COL}' absente des soumissions — le champ 'enqueteur' de dqa_issues restera vide.")
+    report = run_dqa(df, rules, duplicate_subset=DUPLICATE_SUBSET, uuid_col=uuid_col, enumerator_col=enumerator_col)
     print(f"""
 ================================
        DATA QUALITY REPORT
@@ -451,7 +516,7 @@ Statut : {report['status']}
         issues_df["run_id"] = run_id
         issues_df = issues_df.rename(columns={"row": "row_id"})
         issues_df["valeur"] = issues_df["valeur"].astype(str)
-        issues_df[["run_id", "submission_uuid", "row_id", "variable", "type", "valeur"]].to_sql(
+        issues_df[["run_id", "submission_uuid", "row_id", "enqueteur", "variable", "type", "valeur"]].to_sql(
             "dqa_issues", engine, if_exists="append", index=False)
 
     df = prepare_df_for_sql(df)
